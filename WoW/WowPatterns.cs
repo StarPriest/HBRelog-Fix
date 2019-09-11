@@ -2,6 +2,9 @@
 
 namespace HighVoltz.HBRelog.WoW
 {
+    /// <summary>
+    /// who can teach me find it? Thanks very much!
+    /// </summary>
     public static class WowPatterns
     {
         public static readonly Pattern GameStatePattern = Pattern.FromTextstyle(
