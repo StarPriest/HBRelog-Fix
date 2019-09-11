@@ -1,0 +1,582 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows;
+
+using HighVoltz.HBRelog.FiniteStateMachine;
+using HighVoltz.HBRelog.FiniteStateMachine.FiniteStateMachine;
+using HighVoltz.HBRelog.Settings;
+using HighVoltz.HBRelog.WoW.FrameXml;
+using HighVoltz.HBRelog.WoW.Lua;
+using HighVoltz.HBRelog.WoW.States;
+using Process.NET;
+using Region = HighVoltz.HBRelog.WoW.FrameXml.Region;
+
+namespace HighVoltz.HBRelog.WoW
+{
+	public sealed class WowManager : Engine, IGameManager
+	{
+		public WowManager(CharacterProfile profile)
+		{
+			Profile = profile;
+			States = new List<State>
+			{
+				new StartWowState(this),
+                new MonitorState(this),
+                new ScanOffsetsState(this),
+				new WowWindowPlacementState(this),
+				new LoginWowState(this),
+				new RealmSelectState(this),
+				new CharacterSelectState(this),
+				new CharacterCreationState(this),
+			};
+		}
+
+		#region Fields
+
+		private readonly object _lockObject = new object();
+		internal readonly Stopwatch LoginTimer = new Stopwatch();
+
+		private GlueScreen _lastGlueScreen = GlueScreen.None;
+		private DateTime _throttleTimeStamp = DateTime.Now;
+		internal bool ProcessIsReadyForInput;
+		private CharacterProfile _profile;
+
+		internal const int LuaStateGlobalsOffset = 0x50;
+
+		#endregion
+
+		#region Properties
+
+		public WowSettings Settings { get; private set; }
+
+        public ProcessSharp Processsharp { get; internal set; }
+
+        public IntPtr GameWindow { get; internal set; }
+
+        public System.Diagnostics.Process GameProcess => Processsharp?.Native;
+
+        public int GameProcessId { get; internal set; }
+
+        public string GameProcessName { get; internal set; }
+
+        public LuaTable Globals
+		{
+			get
+			{
+				if (Processsharp == null)
+					return null;
+				var luaStatePtr = Processsharp.Memory.Read<IntPtr>((IntPtr) HbRelogManager.Settings.LuaStateOffset);
+				if (luaStatePtr == IntPtr.Zero)
+				{
+#if DEBUG
+					Log.Write("Lua state is not initialized");
+#endif
+					return null;
+				}
+
+				var globalsOffset = Processsharp.Memory.Read<IntPtr>(luaStatePtr + LuaStateGlobalsOffset);
+				if (globalsOffset == IntPtr.Zero)
+				{
+#if DEBUG
+					Log.Write("Lua globals is not initialized");
+#endif
+					return null;
+				}
+				return new LuaTable(Processsharp, globalsOffset);
+			}
+		}
+
+        public LuaTValue GetLuaObject(string luaAccessorCode)
+        {
+            LuaTable curTable = Globals;
+            string[] split = luaAccessorCode.Split('.');
+            for (int i = 0; i < split.Length - 1; i++)
+            {
+                if (curTable == null)
+                    return null;
+
+                LuaTValue val = curTable.GetValue(split[i]);
+                if (val == null || val.Type != LuaType.Table)
+                    return null;
+
+                curTable = val.Table;
+            }
+
+            return curTable.GetValue(split.Last());
+        }
+
+        public WowLockToken LockToken { get; internal set; }
+
+		public IntPtr FocusedWidgetPtr
+			=> Processsharp?.Memory.Read<IntPtr>((IntPtr) HbRelogManager.Settings.FocusedWidgetOffset) ?? IntPtr.Zero;
+
+		public UIObject FocusedWidget
+		{
+			get
+			{
+				var widgetAddress = FocusedWidgetPtr;
+				return widgetAddress != IntPtr.Zero ? UIObject.GetUIObjectFromPointer(this, widgetAddress) : null;
+			}
+		}
+
+		/// <summary>WoW is at the connecting or loading screen</summary>
+		public bool IsConnectingOrLoading
+		{
+			get
+			{
+				try
+				{
+					return Processsharp != null && (Processsharp.Memory.Read<byte>(((IntPtr) HbRelogManager.Settings.GameStateOffset)) & 1) != 0;
+				}
+				catch
+				{
+					return false;
+				}
+			}
+		}
+
+
+
+		public GlueScreen GlueScreen
+		{
+			get
+			{
+				if (Processsharp == null)
+					return GlueScreen.None;
+
+				LuaTValue secondary = GetLuaObject("GlueParent.currentSecondaryScreen");
+				if (secondary != null && secondary.Type == LuaType.String)
+				{
+					switch (secondary.String.Value)
+					{
+						case "cinematics":
+							return GlueScreen.Cinematics;
+						case "movie":
+							return GlueScreen.Movie;
+						case "credits":
+							return GlueScreen.Credits;
+						case "options":
+							return GlueScreen.Options;
+					}
+				}
+
+				LuaTValue primary = GetLuaObject("GlueParent.currentScreen");
+				if (primary != null && primary.Type == LuaType.String)
+				{
+					switch (primary.String.Value)
+					{
+						case "login":
+							return GlueScreen.Login;
+						case "realmlist":
+							return GlueScreen.RealmList;
+						case "charselect":
+							return GlueScreen.CharSelect;
+						case "charcreate":
+							return GlueScreen.CharCreate;
+					}
+				}
+
+				return GlueScreen.None;
+			}
+		}
+
+		internal bool IsUsingLauncher
+		{
+			get
+			{
+				var fileName = Path.GetFileName(Settings.WowPath);
+				return fileName != null && !fileName.Equals("Wow.exe", StringComparison.CurrentCultureIgnoreCase);
+			}
+		}
+
+		public bool ServerIsOnline
+		{
+			get
+			{
+				return !HbRelogManager.Settings.CheckRealmStatus ||
+				       HbRelogManager.WowRealmStatus.RealmIsOnline(Settings.ServerName, Settings.Region);
+			}
+		}
+
+		public bool Throttled
+		{
+			get
+			{
+				var time = DateTime.Now;
+				var ret = time - _throttleTimeStamp < TimeSpan.FromSeconds(HbRelogManager.Settings.LoginDelay);
+				if (!ret)
+					_throttleTimeStamp = time;
+				return ret;
+			}
+		}
+
+		public bool StalledLogin
+		{
+			get
+			{
+				if (Processsharp == null)
+					return false;
+
+				if (!LoginHasQueue && ServerIsOnline && !ServerHasQueue)
+				{
+					GlueScreen glueStatus = GlueScreen;
+					// check if at server selection for tooo long.
+					if (glueStatus == _lastGlueScreen)
+					{
+						if (!LoginTimer.IsRunning)
+							LoginTimer.Start();
+
+						// check once every 40 seconds
+						if (LoginTimer.ElapsedMilliseconds > 40000)
+						{
+							_lastGlueScreen = GlueScreen.None;
+							return true;
+						}
+					}
+					else if (LoginTimer.IsRunning)
+						LoginTimer.Reset();
+					_lastGlueScreen = glueStatus;
+				}
+				return false;
+			}
+		}
+
+        public bool ServerHasQueue
+        {
+            get
+            {
+                try
+                {
+                    if (InGame)
+                        return false;
+                    var button = UIObject.GetUIObjectByName<Button>(this, "GlueDialogButton1");
+                    if (button != null && button.IsVisible)
+                    {
+                        var localizedChangeRealmText = GetLuaObject("CHANGE_REALM");
+                        return localizedChangeRealmText != null &&
+                               button.Text == localizedChangeRealmText.String.Value;
+                    }
+                    return false;
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+            }
+        }
+
+        private Regex _bnetLoginQueueTimeLeftSecondsRegEx;
+        private Regex _bnetLoginQueueTimeLeftUnknownRegEx;
+        private Regex _bnetLoginQueueTimeLeftRegEx;
+
+        public bool LoginHasQueue
+        {
+            get
+            {
+                try
+                {
+                    if (InGame)
+                        return false;
+
+                    var glueDialogTextContol = UIObject.GetUIObjectByName<FontString>(this, "GlueDialogText");
+                    if (glueDialogTextContol == null || !glueDialogTextContol.IsVisible)
+                        return false;
+
+                    if (_bnetLoginQueueTimeLeftSecondsRegEx == null)
+                        _bnetLoginQueueTimeLeftSecondsRegEx = GetLoginQueueRegEx("BNET_LOGIN_QUEUE_TIME_LEFT_SECONDS");
+                    if (_bnetLoginQueueTimeLeftSecondsRegEx.IsMatch(glueDialogTextContol.Text))
+                        return true;
+
+                    if (_bnetLoginQueueTimeLeftUnknownRegEx == null)
+                        _bnetLoginQueueTimeLeftUnknownRegEx = GetLoginQueueRegEx("BNET_LOGIN_QUEUE_TIME_LEFT_UNKNOWN");
+                    if (_bnetLoginQueueTimeLeftUnknownRegEx.IsMatch(glueDialogTextContol.Text))
+                        return true;
+
+                    if (_bnetLoginQueueTimeLeftRegEx == null)
+                        _bnetLoginQueueTimeLeftRegEx = GetLoginQueueRegEx("BNET_LOGIN_QUEUE_TIME_LEFT");
+                    if (_bnetLoginQueueTimeLeftRegEx.IsMatch(glueDialogTextContol.Text))
+                        return true;
+
+                    return false;
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+            }
+        }
+
+	    private Regex GetLoginQueueRegEx(string globalVarName)
+	    {
+	        var text = GetLuaObject(globalVarName).String.Value;
+            return new Regex(text.Replace("%d", "\\d+"));
+	    }
+
+        #endregion
+
+        #region IGameManager Members
+
+        public CharacterProfile Profile
+		{
+			get { return _profile; }
+			private set
+			{
+				_profile = value;
+				Settings = value.Settings.WowSettings;
+			}
+		}
+
+		public void SetSettings(WowSettings settings)
+		{
+			Settings = settings;
+		}
+
+		/// <summary>Character is logged in game</summary>
+		public bool InGame
+		{
+			get
+			{
+				try
+				{
+					if (Processsharp == null)
+						return StartupSequenceIsComplete;
+
+					var state = Processsharp.Memory.Read<byte>((IntPtr) HbRelogManager.Settings.GameStateOffset);
+					var loadingScreenCount = Processsharp.Memory.Read<int>(
+						(IntPtr) HbRelogManager.Settings.LoadingScreenEnableCountOffset);
+					return (state & 2) != 0 && loadingScreenCount == 0;
+				}
+				catch
+				{
+					return false;
+				}
+			}
+		}
+
+		public bool StartupSequenceIsComplete { get; internal set; }
+
+
+        public event EventHandler<ProfileEventArgs> OnStartupSequenceIsComplete;
+
+		public void Start()
+		{
+			lock (_lockObject)
+			{
+				if (File.Exists(Settings.WowPath))
+				{
+					IsRunning = true;
+				}
+				else
+					MessageBox.Show(string.Format("path to WoW.exe does not exist: {0}", Settings.WowPath));
+			}
+		}
+
+		public void Stop()
+		{
+			// try to aquire lock, if fail then kill process anyways.
+			var lockAquried = Monitor.TryEnter(_lockObject, 500);
+			if (IsRunning)
+			{
+                CloseGameProcess();
+                if (Processsharp != null)
+                {
+                    Processsharp.Dispose();
+                    Processsharp = null;
+                }
+                IsRunning = false;
+				StartupSequenceIsComplete = false;
+				if (LockToken != null)
+				{
+					LockToken.Dispose();
+					LockToken = null;
+				}
+            }
+            if (lockAquried)
+				Monitor.Exit(_lockObject);
+
+            Profile.Status = "Stopped";
+        }
+
+        public override void Pulse()
+		{
+			lock (_lockObject)
+			{
+				base.Pulse();
+			}
+		}
+
+		#endregion
+
+		#region Functions
+
+		public void SetStartupSequenceToComplete()
+		{
+			StartupSequenceIsComplete = true;
+			Profile.Log("Login sequence complete");
+			Profile.Status = "Logged into WoW";
+            OnStartupSequenceIsComplete?.Invoke(this, new ProfileEventArgs(Profile));
+        }
+
+		public void CloseGameProcess()
+		{
+            if (GameProcessId <= 0)
+                return;
+
+            var procInfo = new ProcessStartInfo("taskkill", $"/F /PID {GameProcessId}") { CreateNoWindow = true, UseShellExecute  = false};
+            System.Diagnostics.Process.Start(procInfo);
+            Profile.Log("Killing Wow");
+            GameProcessId = 0;
+            StartupSequenceIsComplete = false;
+        }
+
+		internal PointF ConvertWidgetCenterToWin32Coord(Region widget)
+		{
+			var ret = new PointF();
+			var gameFullScreenFrame = UIObject.GetUIObjectByName<Frame>(this, "GlueParent") ??
+			                          UIObject.GetUIObjectByName<Frame>(this, "UIParent");
+			if (gameFullScreenFrame == null)
+				return ret;
+			var gameFullScreenFrameRect = gameFullScreenFrame.Rect;
+			var widgetCenter = widget.Center;
+			var windowInfo = Utility.GetWindowInfo(GameWindow);
+			var leftBorderWidth = windowInfo.rcClient.Left - windowInfo.rcWindow.Left;
+			var bottomBorderWidth = windowInfo.rcWindow.Bottom - windowInfo.rcClient.Bottom;
+			var winClientWidth = windowInfo.rcClient.Right - windowInfo.rcClient.Left;
+			var winClientHeight = windowInfo.rcClient.Bottom - windowInfo.rcClient.Top;
+            
+            // gameFullScreenFrameRect sometimes doesn't fill entire screen.
+            // When that happens, it's centered on the screen, and we need to add the gaps that it doesn't occupy.
+            // Left gap is simply gameFullScreenFrameRect.Left, and we assume the right side gap is same width because frame is centered, so we just multiply left gap by 2.
+
+            var xCo = winClientWidth/(gameFullScreenFrameRect.Width + gameFullScreenFrameRect.Left * 2);
+			var yCo = winClientHeight/gameFullScreenFrameRect.Height + gameFullScreenFrameRect.Top * 2;
+
+			ret.X = widgetCenter.X * xCo + leftBorderWidth;
+			ret.Y = widgetCenter.Y * yCo + bottomBorderWidth;
+			// flip the Y coord around because in WoW's UI coord space the Y goes up where as in windows it goes down.
+			ret.Y = windowInfo.rcWindow.Bottom - windowInfo.rcWindow.Top - ret.Y;
+			return ret;
+		}
+
+        public bool WaitForMessageHandler(int timeout)
+        {
+            IntPtr handle = GameWindow;
+            UIntPtr result;
+            IntPtr response = NativeMethods.SendMessageTimeout(handle, (uint)NativeMethods.Message.WM_NULL,
+                                                               IntPtr.Zero,
+                                                               UIntPtr.Zero,
+                                                               NativeMethods.SendMessageTimeoutFlags
+                                                                            .SMTO_ABORTIFHUNG,
+                                                               (uint)timeout, out result);
+
+            return response != IntPtr.Zero;
+        }
+        #endregion
+
+        #region Embeded Types
+
+        #endregion
+
+        #region GlueDialog
+
+        public string GlueDialogType
+        {
+            get
+            {
+                var glueDialog = UIObject.GetUIObjectByName<Frame>(this, "GlueDialog");
+
+                if (glueDialog != null && glueDialog.IsVisible)
+                {
+                    var which = GetLuaObject("GlueDialog.which");
+                    if (which != null && !string.IsNullOrEmpty(which.String.Value))
+                        return which.String.Value;
+                }
+                return string.Empty;
+            }
+        }
+
+        public string GlueDialogData
+        {
+            get
+            {
+                var glueDialog = UIObject.GetUIObjectByName<Frame>(this, "GlueDialog");
+
+                if (glueDialog != null && glueDialog.IsVisible)
+                {
+                    var data = GetLuaObject("GlueDialog.data");
+                    if (data != null && data.Pointer != IntPtr.Zero && data.Type != LuaType.Nil && !string.IsNullOrEmpty(data.String.Value))
+                        return data.String.Value;
+                }
+                return string.Empty;
+            }
+        }
+
+        public string GlueDialogHtmlFormatText
+        {
+            get
+            {
+                var glueDialogHTML = UIObject.GetUIObjectByName<Frame>(this, "GlueDialogHTML");
+
+                if (glueDialogHTML != null && glueDialogHTML.IsVisible)
+                    return glueDialogHTML.Regions.OfType<FontString>().FirstOrDefault()?.Text ?? "";
+                return "";
+            }
+        }
+
+        public string GlueDialogTitle
+        {
+            get
+            {
+                var glueDialogTitleFontString = UIObject.GetUIObjectByName<FontString>(this, "GlueDialogTitle");
+                if (glueDialogTitleFontString != null && glueDialogTitleFontString.IsVisible)
+                    return glueDialogTitleFontString.Text;
+                return string.Empty;
+            }
+        }
+
+        public string GlueDialogText
+        {
+            get
+            {
+                var glueDialogTextContol = UIObject.GetUIObjectByName<FontString>(this, "GlueDialogText");
+                if (glueDialogTextContol != null && glueDialogTextContol.IsVisible)
+                    return glueDialogTextContol.Text;
+                return string.Empty;
+            }
+        }
+
+        public string GlueDialogButton1Text
+        {
+            get
+            {
+                var glueDialogButton1Text = UIObject.GetUIObjectByName<Button>(this, "GlueDialogButton1");
+                if (glueDialogButton1Text != null && glueDialogButton1Text.IsVisible)
+                    return glueDialogButton1Text.Text;
+                return string.Empty;
+            }
+        }
+    }
+
+    #endregion
+
+    // incomplete. missing Server Queue (if there is one).
+    public enum GlueScreen
+	{
+		None,
+		Login,
+		RealmList,
+		CharSelect,
+		CharCreate,
+
+		Cinematics,
+		Credits,
+		Movie,
+		Options
+	}
+}
